@@ -4,22 +4,27 @@ import RNBluetoothClassic, {
   BluetoothDevice,
   BluetoothEventSubscription,
 } from 'react-native-bluetooth-classic';
-import Tts from 'react-native-tts';
+// import Tts from 'react-native-tts';
+import * as Speech from 'expo-speech';
 
 const App: React.FC = () => {
   const [devices, setDevices] = useState<BluetoothDevice[]>([]);
   const [status, setStatus] = useState<string>('Disconnected');
   const [text, setText] = useState<string>('');
-  const [subscription, setSubscription] =
-    useState<BluetoothEventSubscription | null>(null);
+  const [subscription, setSubscription] = useState<BluetoothEventSubscription | null>(null);
   
-  useEffect(() => {
-    if (Tts) {
-      Tts.setDefaultLanguage('en-US');
-    } else {
-      console.warn('Tts is not available.');
-    }
+  // useEffect(() => {
+  //   if (Tts) {
+  //     Tts.setDefaultLanguage('en-US');
+  //   } else {
+  //     console.warn('Tts is not available.');
+  //   }
 
+  //   return () => {
+  //     subscription?.remove();
+  //   };
+  // }, [subscription]);
+  useEffect(() => {
     return () => {
       subscription?.remove();
     };
@@ -46,11 +51,14 @@ const App: React.FC = () => {
         setStatus('Connected');
 
         // Now that the device is connected, listen for incoming data
+        // const sub = device.onDataReceived((data) => {
+        //   setText(data.data);
+        //   Tts.speak(data.data);
+        // });
         const sub = device.onDataReceived((data) => {
           setText(data.data);
-          Tts.speak(data.data);
+          Speech.speak(data.data, { language: 'en-US' });
         });
-
         setSubscription(sub);  // Save the subscription for cleanup
       } else {
         console.warn('Connection failed');
