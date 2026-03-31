@@ -1,13 +1,14 @@
 import * as Speech from 'expo-speech';
 import React, { useEffect, useState } from 'react';
 import {
+  ActivityIndicator,
   PermissionsAndroid,
   Platform,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
-  View
+  View,
 } from 'react-native';
 import RNBluetoothClassic, {
   BluetoothDevice,
@@ -16,19 +17,30 @@ import RNBluetoothClassic, {
 
 const App: React.FC = () => {
   const [pairedDevices, setPairedDevices] = useState<BluetoothDevice[]>([]);
+  const [compatibleDevices, setCompatibleDevices] = useState<BluetoothDevice[]>([]);
+  const [otherDevices, setOtherDevices] = useState<BluetoothDevice[]>([]);
   const [status, setStatus] = useState<string>('Disconnected');
   const [text, setText] = useState<string>('');
   const [subscription, setSubscription] = useState<BluetoothEventSubscription | null>(null);
   const [connectingDevice, setConnectingDevice] = useState<string | null>(null);
   const [defaultDevice, setDefaultDevice] = useState<BluetoothDevice | null>(null);
-  const [scanning, setScanning] = useState(false);
+  const [scanning, setScanning] = useState<boolean>(false);
 
   // Cleanup subscription on unmount
   useEffect(() => {
-    return () => subscription?.remove();
-  }, [subscription]);
+    return () => {
+      subscription?.remove();
 
-  // Request permissions
+      // Wrap async calls in an IIFE
+      (async () => {
+        if (defaultDevice) {
+          const connected = await defaultDevice.isConnected();
+          if (connected) await defaultDevice.disconnect();
+        }
+      })();
+    };
+  }, [subscription, defaultDevice]);
+  // Request permissions (Android 12+)
   const requestPermissions = async () => {
     if (Platform.OS === 'android' && Platform.Version >= 31) {
       const granted = await PermissionsAndroid.requestMultiple([
@@ -56,20 +68,18 @@ const App: React.FC = () => {
     }
   };
 
-  // Auto-connect to last paired HC-05
-  const autoConnectDefaultDevice = async () => {
-    const bonded = await loadPairedDevices();
-    const hc05 = bonded.find(
-      (d) => d.name?.toUpperCase().includes('HC-05') && ['CLASSIC', 'Classic'].includes(d.type)
-    );
-    if (hc05) {
-      console.log('Auto-connecting to HC-05:', hc05.name);
-      connectDevice(hc05);
-    }
+  // Subscribe to incoming data
+  const subscribeToData = (device: BluetoothDevice) => {
+    const sub = device.onDataReceived((data) => {
+      const message = data.data.trim();
+      setText((prev) => prev + (prev ? '\n' : '') + message);
+      Speech.speak(message, { language: 'en-US' });
+    });
+    setSubscription(sub);
   };
 
-  // Connect function with retry loop
-  const connectDevice = async (device: BluetoothDevice, retries = 5, delayMs = 2000) => {
+  // Connect device with retry
+  const connectDeviceOld = async (device: BluetoothDevice, retries = 5, delayMs = 2000) => {
     if (connectingDevice) return;
     setConnectingDevice(device.address);
     setStatus(`Connecting to ${device.name || device.address}...`);
@@ -79,17 +89,11 @@ const App: React.FC = () => {
         if (!(await device.isConnected())) {
           await RNBluetoothClassic.cancelDiscovery();
           await device.connect({ delimiter: '\n' });
+          subscribeToData(device);
         }
-
         setStatus(`Connected to ${device.name}`);
         setDefaultDevice(device);
-
-        const sub = device.onDataReceived((data) => {
-          setText((prev) => prev + data.data); // append if multiple messages
-          Speech.speak(data.data, { language: 'en-US' });
-        });
-        setSubscription(sub);
-        break; // successful connection
+        break; // success
       } catch (err) {
         console.warn(`Attempt ${attempt} failed:`, err);
         setStatus(`Retrying... (${attempt})`);
@@ -99,17 +103,109 @@ const App: React.FC = () => {
 
     setConnectingDevice(null);
   };
+  
+  const connectDevice = async (
+    device: BluetoothDevice,
+    retries = 5,
+    delayMs = 2000
+  ) => {
+    if (connectingDevice) return;
 
-  // Manual scan + connect
-  const scanAndConnect = async () => {
-    const hasPermission = await requestPermissions();
-    if (!hasPermission) return console.warn('Permissions denied');
-    setScanning(true);
-    await loadPairedDevices();
-    setScanning(false);
+    setConnectingDevice(device.address);
+    setStatus(`Connecting to ${device.name || device.address}...`);
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const isConnected = await RNBluetoothClassic.isDeviceConnected(
+          device.address
+        );
+
+        if (!isConnected) {
+          await RNBluetoothClassic.cancelDiscovery();
+
+          const connection = await RNBluetoothClassic.connectToDevice(
+            device.address,
+            {
+              CONNECTOR_TYPE: 'rfcomm',
+              DELIMITER: '\n',
+              DEVICE_CHARSET: Platform.OS === 'ios' ? 1536 : 'utf-8',
+            }
+          );
+
+          if (!connection) {
+            throw new Error('Connection returned null/false');
+          }
+
+          // OPTIONAL: re-fetch device instance if needed
+          // const connectedDevice = await RNBluetoothClassic.getConnectedDevices()
+
+          subscribeToData(device);
+        }
+
+        setStatus(`Connected to ${device.name || device.address}`);
+        setDefaultDevice(device);
+        break; // ✅ success
+      } catch (err) {
+        console.warn(`Attempt ${attempt} failed:`, err);
+
+        if (attempt === retries) {
+          setStatus(`Failed to connect to ${device.name}`);
+        } else {
+          setStatus(`Retrying... (${attempt}/${retries})`);
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+      }
+    }
+
+    setConnectingDevice(null);
   };
 
-  // UI render
+  // Auto-connect to first HC-05
+  const autoConnectDefaultDevice = async () => {
+    const bonded = await loadPairedDevices();
+    const hc05 = bonded.find(
+      (d) => d.name?.toUpperCase().includes('HC-05') && ['CLASSIC', 'Classic'].includes(d.type)
+    );
+    if (hc05) connectDevice(hc05);
+  };
+
+  // Scan unpaired devices and categorize
+  const scanDevices = async () => {
+    const hasPermission = await requestPermissions();
+    if (!hasPermission) return console.warn('Permissions denied');
+
+    setScanning(true);
+    setCompatibleDevices([]);
+    setOtherDevices([]);
+
+    try {
+      const bonded = await loadPairedDevices();
+      const unpaired = await RNBluetoothClassic.startDiscovery();
+
+      const compatible: BluetoothDevice[] = [];
+      const others: BluetoothDevice[] = [];
+
+      unpaired.forEach((d) => {
+        const alreadyPaired = bonded.find((p) => p.address === d.address);
+        if (!alreadyPaired) {
+          if (d.name?.toUpperCase().includes('HC-05') && ['CLASSIC', 'Classic'].includes(d.type)) {
+            compatible.push(d);
+          } else {
+            others.push(d);
+          }
+        }
+      });
+
+      setCompatibleDevices(compatible);
+      setOtherDevices(others);
+    } catch (err) {
+      console.warn('Scan failed:', err);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  // Render a device card
   const renderDevice = (device: BluetoothDevice) => {
     const isDefault = defaultDevice?.address === device.address;
     return (
@@ -140,30 +236,44 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    // Try to auto-connect on startup
     autoConnectDefaultDevice();
   }, []);
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>Smart Glove</Text>
-      <Text style={styles.status}>Status: {status}</Text>
-
-      <TouchableOpacity
-        style={[styles.scanButton, (scanning || connectingDevice) && styles.disabledButton]}
-        onPress={scanAndConnect}
-        disabled={!!connectingDevice || scanning}
-      >
-        <Text style={styles.buttonText}>{scanning ? 'Scanning...' : 'Scan Devices'}</Text>
-      </TouchableOpacity>
-
-      {pairedDevices.map(renderDevice)}
 
       {text ? (
         <View style={styles.incomingTextCard}>
           <Text style={styles.incomingText}>{text}</Text>
         </View>
       ) : null}
+      <Text style={styles.status}>Status: {status}</Text>
+
+      <TouchableOpacity
+        style={[styles.scanButton, (scanning || connectingDevice) && styles.disabledButton]}
+        onPress={scanDevices}
+        disabled={!!connectingDevice || scanning}
+      >
+        <Text style={styles.buttonText}>{scanning ? 'Scanning...' : 'Scan Devices'}</Text>
+      </TouchableOpacity>
+
+      <Text style={styles.sectionTitle}>Paired Devices</Text>
+      {pairedDevices.map(renderDevice)}
+
+      <Text style={styles.sectionTitle}>Compatible Devices (HC-05)</Text>
+      {compatibleDevices.map(renderDevice)}
+
+      <Text style={styles.sectionTitle}>Other Devices</Text>
+      {otherDevices.map(renderDevice)}
+
+      {text ? (
+        <View style={styles.incomingTextCard}>
+          <Text style={styles.incomingText}>{text}</Text>
+        </View>
+      ) : null}
+
+      {scanning && <ActivityIndicator size="large" style={{ marginTop: 15 }} />}
     </ScrollView>
   );
 };
@@ -175,6 +285,7 @@ const styles = StyleSheet.create({
   scanButton: { backgroundColor: '#4A90E2', paddingVertical: 10, borderRadius: 6, alignItems: 'center', marginBottom: 15 },
   disabledButton: { backgroundColor: '#9BBCE0' },
   buttonText: { color: 'white', fontWeight: 'bold', fontSize: 14 },
+  sectionTitle: { fontSize: 18, fontWeight: '600', marginTop: 12, marginBottom: 6 },
   deviceCard: { borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 10, marginBottom: 8, backgroundColor: '#f9f9f9', flexDirection: 'row', justifyContent: 'space-between' },
   connectedDevice: { borderColor: '#34A853', backgroundColor: '#e6f4ea' },
   deviceName: { fontSize: 16, fontWeight: '600' },
